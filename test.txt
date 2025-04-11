@@ -1,0 +1,2458 @@
+/**
+****************************************************************************************
+ * @Author       : Noah Lau
+ * @Date         : 2023-07-03 14:14:44
+ * @LastEditors  : Noah Lau
+ * @LastEditTime : 2023-11-16 13:57:38
+ * @FilePath     : \Obulb2_Plus_TLSR825X_3.5.0\software\TuyaOS\apps\Obulb2_Pro\src\app_common.c
+ * @Description  : 
+ * @ ***************USE UTF8 UTF8 UTF8************
+ * @Copyright (c) 2022-2032 OLIGHT CO.,LTD, All Rights Reserved. 
+****************************************************************************************
+*/
+
+#include "tal_system.h"
+#include "tal_gpio.h"
+#include "tal_uart.h"
+#include "tal_i2c.h"
+#include "tal_sw_timer.h"
+#include "tal_memory.h"
+#include "tal_log.h"
+#include "tal_utc.h"
+#include "tal_rtc.h"
+#include "tal_oled.h"
+#include "tal_bluetooth_mesh_device.h"
+#include "tal_uart_protocol.h"
+#include "tal_ble_rssi_test.h"
+#include "ty_ble_ota_adapt.h"
+#include "app_config.h"
+#include"app_common.h"
+#include "tal_mesh_factory_test.h"
+#include "tuya_sdk_test.h"
+/*            noah added start            */
+static inline void skc6812_logic1(void);
+static inline void skc6812_logic0(void);
+static inline void WS2812WR(UINT16_T leds ,UINT32_T color);
+
+
+extern void WS2812BFX_Delay_Handle(void);
+
+extern UINT8_T send_data_trig;
+extern UINT32_T pixelBuffer[PIXEL_NUM];
+
+/// light ctrl data(status)
+LIGHT_CTRL_DATA_T tLightCtrlData;
+
+
+TIMER_ID sg_test__timer_id = 2;
+TIMER_ID countdown_sw_timer = 1;
+VOID_T app_light_ctrl_countdown_timer_callback(TIMER_ID timer_id, VOID_T *arg);
+VOID_T test_software_timer2_callback(TIMER_ID timer_id, VOID_T *arg);
+/*            noah added ebds            */
+#define tal_main_debug(...)     TAL_PR_DEBUG(__VA_ARGS__)
+
+STATIC UINT8_T gatt_connect_state = 0;
+
+STATIC UINT8_T count_time_status = 0;
+STATIC TIMER_ID app_mdev_test_timer_id = NULL;
+extern Off_event off_event ;
+
+uint8_t     Light_Speed_Lv=3;
+
+VOID_T tuya_log_output_cb(IN CONST CHAR_T *str)
+{
+    extern VOID_T tkl_system_log_output(CONST UINT8_T *buf, UINT32_T size);
+    tkl_system_log_output((VOID_T*)str, strlen((CHAR_T*)str));
+}
+
+
+VOID app_ble_connect_state_set(UINT8_T state){
+    gatt_connect_state = state;
+}
+
+UINT8_T app_ble_connect_state_get(VOID){
+    return gatt_connect_state;
+}
+
+OPERATE_RET tuya_firmware_config(VOID_T)
+{
+    UINT8_T pid[] = PRODUCTKEY;
+    UINT8_T firmware_key[] = PRODUCTKEY;
+    UINT8_T firmware_name[] = BUILD_FIRMNAME;
+    UINT8_T firmware_version[] = FW_VERSION;
+    UINT16_T mesh_category = MESH_CATEGORY;
+
+    tal_mesh_factory_firmware_info_set(firmware_name, firmware_version);
+    tal_mesh_gatt_ota_version_set(FW_VERSION_HEX);
+    tal_firmware_infor_set(IS_FIRMWARE_KEY, pid, firmware_key, FW_VERSION_HEX, mesh_category, NEED_PUBLISH_ADDR);
+    return OPRT_OK;
+}
+
+STATIC VOID_T tuya_uart_irq_rx_cb(TUYA_UART_NUM_E port_num, VOID_T *buff, UINT16_T len)
+{
+//    TAL_PR_HEXDUMP_DEBUG("uart_recv", buff, len);
+    if(port_num == 0) {                              //串口0接收到数据
+        tal_uart_receive_common_data(buff, len);
+        //OlightUart_ReceiveStr(buff, len);            //串口解析协议数据
+    }
+}
+
+UINT16_T light_ness;
+OPERATE_RET app_mesh_data_recv(TAL_MESH_ACCESS_MSG_T *msg_raw, TAL_MESH_NET_PARAM_T *net_param){
+    static UINT8_T onoff_data[1]  = {0x01};
+    static UINT8_T lightness_data[2]  = {0xFF, 0xFF};
+    static UINT8_T light_clt_temp_data[4]  = {0x20, 0x03};
+    static UINT8_T light_hsl[6]  = {0xFF, 0x7F, 0x00, 0x00, 0xFF, 0xFF};
+    UINT8_T light_ctl_data[4] = {0}; 
+    static u8   music_tr;
+    UINT16_T light_present;
+    UINT16_T hue,sat,lightness;
+    UINT16_T hsv_hue,hsv_sat,hsv_lightness;
+	
+    OPERATE_RET opRet = 1;
+    bool bActiveFlag = FALSE;
+
+    // TAL_PR_HEXDUMP_DEBUG("op_code",msg_raw->opcode,sizeof(msg_raw->opcode));
+    TAL_PR_HEXDUMP_DEBUG("dp_data",msg_raw->data,msg_raw->data_len);
+
+	TAL_PR_DEBUG("get dp_data=%x",msg_raw->opcode);//duandebug
+
+    if(sys_status.lock_key || sys_status.special_mode)
+    {
+        return;
+    }
+
+#if ACTIVE_SLEEP_TEST
+    // if (0x8b == msg_raw->data[0] && 0x01 == msg_raw->data[1])
+    // if (msg_raw->opcode != TAL_MESH_OPCODE_ON_OFF_GET)
+    {
+        // tal_main_debug("no active sleep");
+
+        extern TIMER_ID repeat_active_sleep_timer_id;
+        extern u16 active_sleep_cnt;
+        void send_a_little_bomb_packet_ready();
+
+        active_sleep_cnt = 0;
+
+        if (repeat_active_sleep_timer_id != NULL) // 不要活性睡眠了
+        {
+            tal_sw_timer_delete(repeat_active_sleep_timer_id);
+            repeat_active_sleep_timer_id = NULL;
+        }
+
+        // if (msg_raw->opcode != TAL_MESH_OPCODE_WRITE_UNACK ||
+        //     (msg_raw->opcode == TAL_MESH_OPCODE_WRITE_UNACK && 0x8b != msg_raw->data[0] && 0x01 != msg_raw->data[1])) // 非轰炸包就要去发少许轰炸包
+        // {
+        //     tal_main_debug("send_a_little_bomb_packet_ready");
+        //     send_a_little_bomb_packet_ready();
+        // }
+    }
+#endif
+
+    switch(msg_raw->opcode){
+        case TAL_MESH_OPCODE_ON_OFF_GET:
+            tal_main_debug("/***********get_on_off***********/");
+            onoff_data[0] = app_light_ctrl_data_switch_get();
+            tal_main_debug("get_on_off %d",onoff_data[0]);
+            tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_ON_OFF_STAT, onoff_data, sizeof(onoff_data));
+            break;
+        case TAL_MESH_OPCODE_ON_OFF_SET:
+        case TAL_MESH_OPCODE_ON_OFF_SET_UNACK:
+            onoff_data[0] = msg_raw->data[0];
+           opRet =  app_light_ctrl_data_switch_set(onoff_data[0]);
+            if(TAL_MESH_OPCODE_ON_OFF_SET == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_ON_OFF_STAT, onoff_data, sizeof(onoff_data));
+				
+            }
+            if (app_light_ctrl_data_switch_get())
+            {
+                set_local_mode_tuya(app_light_ctrl_data_mode_get_value());
+            }
+            if(OPRT_OK == opRet) {
+                bActiveFlag = TRUE;
+                //app_light_ctrl_data_countdown_set(0);
+            }            
+#if TUYA_SDK_TEST
+            tal_sdk_test_mesh_data_write(1, 1, onoff_data, 1);
+#endif
+            TAL_PR_HEXDUMP_DEBUG("on_off",msg_raw->data,sizeof(onoff_data));
+            break;
+        case TAL_MESH_OPCODE_LIGHTNESS_GET:
+             
+             light_present = ((float)sys_status.pwm_store_data / MAX_WHITE_LIGHT) * 65535;  //参数转换 255-->65535//
+
+             if(light_present<=DEFAULT_WHITE_LIGHT+1)//最低亮度显示为1
+             {
+                light_present = 1;
+             }
+            TAL_PR_DEBUG("light_present=%d",light_present);
+             lightness_data[0] = light_present & 0xFF;
+             lightness_data[1] = light_present >> 8;
+            //  TAL_PR_HEXDUMP_DEBUG("rc_lightness",lightness_data,sizeof(lightness_data));
+
+            tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHTNESS_STAT, lightness_data, sizeof(lightness_data));
+            break;
+        case TAL_MESH_OPCODE_LIGHTNESS_SET:
+        case TAL_MESH_OPCODE_LIGHTNESS_SET_UNACK:{
+           
+            tal_system_memcpy(lightness_data, msg_raw->data, sizeof(lightness_data));
+            if(TAL_MESH_OPCODE_LIGHTNESS_SET == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHTNESS_STAT, lightness_data, sizeof(lightness_data));
+            }
+
+            UINT32_T lightness_dp = 0;
+            lightness_dp = (lightness_data[1] << 8) + lightness_data[0];
+            lightness_dp = (float)lightness_dp * (MAX_WHITE_LIGHT) / (65535);  //参数转换 65535-->255//
+            TAL_PR_DEBUG("lightness_dp=%d",lightness_dp);
+
+            if(lightness_dp < DEFAULT_WHITE_LIGHT)//强制处理关系，处理MIN//
+            {
+                lightness_dp = DEFAULT_WHITE_LIGHT;
+            }
+
+            if(sys_status.vol_limt_lightness == 1)
+            {
+                if(lightness_dp > LIMT_MIN_LIGHTNESS)                   //当PWM >35 -==35 ,闪烁//
+                {
+                    lightness_dp = LIMT_MIN_LIGHTNESS;
+                    // gpio_write(EN_WHITE_PIN,0);  
+                    // sleep_ms(50);
+                    // gpio_write(EN_WHITE_PIN,1); 
+                }
+            }
+            else if (sys_status.temp_protect_status)    //温度限制档位//
+            {
+                if(lightness_dp >  sys_status.max_lightness) //当调节的PWM大于当前的最大值限制成当前最大值则闪烁//
+                {
+                    lightness_dp =  sys_status.max_lightness;
+                    // gpio_write(EN_WHITE_PIN,0);  
+                    // sleep_ms(50);
+                    // gpio_write(EN_WHITE_PIN,1);  
+                }                
+            }
+
+            sys_status.pwm_store_data = lightness_dp;
+            gpio_write(EN_WHITE_PIN,1);         
+            TAL_PR_DEBUG("pwm_store_data:%d",sys_status.pwm_store_data);
+            app_light_ctrl_data_bright_set(sys_status.pwm_store_data);  //*记忆当前PWM,以及模式//
+
+            if (sys_status.output_mode == MODE_OFF) //* 如果是关机下，触发亮度条 //
+            {
+               app_light_ctrl_data_switch_set(1);    //* 需要设置开机状态并上报 //
+               app_light_ctrl_data_onoff_response(1);//* 上报开机状态 //
+            }
+
+            set_local_mode_tuya(app_light_ctrl_data_mode_get_value());  //APP模式同步本地模式//
+
+            light_onoff_slow(0,sys_status.pwm_store_data);
+#if TUYA_SDK_TEST
+            // tal_sdk_test_mesh_data_write(3, 2, dp_data, 4);
+#endif
+            }
+//             TAL_PR_HEXDUMP_DEBUG("lightness",msg_raw->data,sizeof(lightness_data));
+            // if(OPRT_OK == opRet) {
+            //     bActiveFlag = TRUE;
+            // }               
+            break;
+        case TAL_MESH_OPCODE_LIGHT_CTL_GET:
+            // tal_main_debug("/***********get_ctl***********/");
+             light_present = ((float)sys_status.pwm_store_data / MAX_WHITE_LIGHT) * 65535;
+             if(light_present<DEFAULT_WHITE_LIGHT+1)
+             {
+                light_present = 1;
+             }
+             lightness_data[0] = light_present & 0xFF;
+             lightness_data[1] = light_present >> 8;
+            tal_main_debug("get_ctl %d",light_present);
+            tal_system_memcpy(light_ctl_data, lightness_data, 2);
+            tal_system_memcpy(light_ctl_data+2, light_clt_temp_data, 2);
+            tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_CTL_STAT, light_ctl_data, sizeof(light_ctl_data));
+
+            // Send_battery_data();
+            break;
+        case TAL_MESH_OPCODE_LIGHT_CTL_SET:
+        case TAL_MESH_OPCODE_LIGHT_CTL_SET_UNACK:
+            tal_system_memcpy(lightness_data, msg_raw->data, 2);
+            tal_system_memcpy(light_clt_temp_data, msg_raw->data+2, 2);
+            tal_system_memcpy(light_ctl_data, msg_raw->data, sizeof(light_ctl_data));
+            if(TAL_MESH_OPCODE_LIGHT_CTL_SET == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_CTL_STAT, light_ctl_data, sizeof(light_ctl_data));
+            }
+            break;
+        case TAL_MESH_OPCODE_LIGHT_CTL_TEMP_GET:
+            tal_main_debug("/***********get_ctl_temp***********/");
+            tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_CTL_TEMP_STAT, light_clt_temp_data, sizeof(light_clt_temp_data));
+            // Send_battery_data();
+            // app_light_ctrl_data_mode_response();
+            break;
+        case TAL_MESH_OPCODE_LIGHT_CTL_TEMP_SET:
+        case TAL_MESH_OPCODE_LIGHT_CTL_TEMP_SET_UNACK:{
+            tal_system_memcpy(light_clt_temp_data, msg_raw->data, sizeof(light_clt_temp_data));
+            if(TAL_MESH_OPCODE_LIGHT_CTL_TEMP_SET == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_CTL_TEMP_STAT, light_clt_temp_data, sizeof(light_clt_temp_data));
+            }
+
+            UINT32_T temp_dp = 0;
+            temp_dp = (light_clt_temp_data[1] << 8) + light_clt_temp_data[0];
+            temp_dp = ((float)temp_dp - 800) * 1000 / 19200;
+            UINT8_T dp_data[4] = {0};
+            dp_data[0] = 0;
+            dp_data[1] = 0;
+            dp_data[2] = temp_dp >> 8;
+            dp_data[3] = temp_dp & 0xFF;
+#if TUYA_SDK_TEST
+            tal_sdk_test_mesh_data_write(4, 2, dp_data, 4);
+#endif
+            }
+            break;
+        case TAL_MESH_OPCODE_LIGHT_HSL_GET:
+            hsv_hue = sys_status.color_hub_data;
+            hsv_sat = (float)sys_status.color_sat_data*1000/255;
+            hsv_lightness =(float) sys_status.color_lightness_data*1000/MAX_COLOR_LIGHT; //*实际亮度值转换成上报APP的数值//
+            if(hsv_lightness <= MIN_COLOR_LIGHTNESS) //*当彩光亮度低于限制值则设置为限制值 //
+            {
+                hsv_lightness = MIN_COLOR_LIGHTNESS;
+            }
+
+            noah_tools_hsv2hsl(hsv_hue,hsv_sat,hsv_lightness,&hue, &sat, &lightness); 
+            // lightness = ((float)lightness / 255) * 1000;
+            // hue = ((float)hue / 360) * 65535;
+            // sat = ((float)sat / 255) * 65535;            
+            tal_main_debug("lightness:%d", lightness);
+            tal_main_debug("hue:%d", hue);
+            tal_main_debug("sat:%d", sat);   
+            light_hsl[0] = lightness & 0XFF;
+            light_hsl[1] = lightness >> 8;
+            light_hsl[2] = hue & 0XFF;
+            light_hsl[3] = hue >> 8;
+            light_hsl[4] = sat & 0XFF;
+            light_hsl[5] = sat >> 8;        
+
+            tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_HSL_STAT, light_hsl, sizeof(light_hsl));
+            break;
+        case TAL_MESH_OPCODE_LIGHT_HSL_SET:
+        case TAL_MESH_OPCODE_LIGHT_HSL_SET_UNACK:{
+            tal_system_memcpy(light_hsl, msg_raw->data, sizeof(light_hsl));
+            if(TAL_MESH_OPCODE_LIGHT_HSL_SET == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_LIGHT_HSL_STAT, light_hsl, sizeof(light_hsl));
+            }
+            TAL_PR_HEXDUMP_DEBUG("hsl",light_hsl,sizeof(light_hsl));
+
+            UINT8_T hsl_dp_data[6] = {0};
+            UINT16_T h,s,l = 0;
+            UINT16_T color_hub_data,color_sat_data,color_lightness_data;
+
+            l = (light_hsl[1] << 8) + light_hsl[0];
+            h = (light_hsl[3] << 8) + light_hsl[2];
+            s = (light_hsl[5] << 8) + light_hsl[4];  
+
+            noah_tools_hsl2hsv(h,s,l,&color_hub_data,&color_sat_data,&color_lightness_data);            
+            color_sat_data = (float)color_sat_data * 255 / 1000;
+            color_lightness_data = (float)color_lightness_data * MAX_COLOR_LIGHT / 1000;  
+
+            // TAL_PR_DEBUG("color_hub_data=%d",color_hub_data);
+            // TAL_PR_DEBUG("color_sat_data=%d",color_sat_data);
+            // TAL_PR_DEBUG("color_lightness_data=%d",color_lightness_data);
+
+            // TAL_PR_DEBUG("sys.color_hub_data=%d",sys_status.color_hub_data);
+            // TAL_PR_DEBUG("sys.color_sat_data=%d",sys_status.color_sat_data);
+            // TAL_PR_DEBUG("sys.color_lightness_data=%d",sys_status.color_lightness_data);
+
+            //加载降档数值,电压降档优先
+            if(sys_status.vol_limt_lightness == 1)
+            {
+                if(color_lightness_data > LIMT_MIN_COLOR_LIGHTNESS)
+                {
+                    color_lightness_data = LIMT_MIN_COLOR_LIGHTNESS;
+                }
+            }
+            else if (sys_status.temp_protect_status==1)
+            {
+                if((color_lightness_data > sys_status.max_color_lightness)  )
+                {
+                    color_lightness_data = sys_status.max_color_lightness;
+                }                            
+            }  
+
+            //赋予新数值
+            sys_status.color_lightness_data = color_lightness_data;             
+            sys_status.color_hub_data = color_hub_data;
+            sys_status.color_sat_data = color_sat_data;
+
+            // noah_tools_hsl2hsv(h,s,l,&sys_status.color_hub_data,&sys_status.color_sat_data,&sys_status.color_lightness_data);                    
+            // sys_status.color_sat_data = (float)sys_status.color_sat_data * 255 / 1000;
+            // sys_status.color_lightness_data = (float)sys_status.color_lightness_data * MAX_COLOR_LIGHT / 1000;  //limit lightness max value 90//
+
+            if(sys_status.color_lightness_data <= MIN_COLOR_LIGHTNESS)
+            {
+               sys_status.color_lightness_data = MIN_COLOR_LIGHTNESS; 
+            }
+
+            if(COLOR_MODE == app_light_ctrl_data_mode_get_value()){
+                // app_light_ctrl_data_mode_set(COLOR_MODE);
+                set_local_mode_tuya(app_light_ctrl_data_mode_get_value());
+                // sys_status.output_mode = MODE_COLOR;
+            }
+            else
+            {
+                //* 为解决直接发送HSL指令时识别不出模式 Alexa//
+                app_light_ctrl_data_mode_set(COLOR_MODE);// 触发时要先设置模式//
+                app_light_user_mode_set_value(STATIC_MODE);   //静态色盘//             
+                sys_status.output_mode = MODE_COLOR; //本地输出模式更改不替换//   
+                gpio_write(EN_RGB,1);        
+            }
+            sys_status.app_contrl_change = 1;  
+
+            tal_main_debug("final color_hub_data:%d", sys_status.color_hub_data);
+            tal_main_debug("final color_sat_data:%d", sys_status.color_sat_data);
+            tal_main_debug("final color_lightness_data:%d", sys_status.color_lightness_data);                 
+            sys_status.en_reset_check = 1;  
+
+            // gpio_write(EN_RGB,0);      
+            light_onoff_HSV(0,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+            gpio_write(EN_RGB,1);
+
+            // static_color_open_handle();
+            // h = (float)h * 360 / 65535;
+            // s = (float)s * 1000 / 65535;
+            // l = (float)l * 1000 / 65535;
+
+            // hsl_dp_data[0] = h >> 8;
+            // hsl_dp_data[1] = h & 0xFF;
+            // hsl_dp_data[2] = s >> 8;
+            // hsl_dp_data[3] = s & 0xFF;
+            // hsl_dp_data[4] = l >> 8;
+            // hsl_dp_data[5] = l & 0xFF;
+#if TUYA_SDK_TEST
+            tal_sdk_test_mesh_data_write(5, 0, hsl_dp_data, 6);
+#endif
+            }
+            // if(OPRT_OK == opRet) {
+            //     bActiveFlag = TRUE;
+            // }              
+            break;
+  // vendor model cmd-----------------
+        case TAL_MESH_OPCODE_READ:	
+            tal_main_debug("data_len:%d", msg_raw->data_len);
+            // if(0==msg_raw->data_len)
+            // {
+            //     u8 data = app_light_ctrl_data_mode_get_value();
+            //     tal_main_debug("lightmode1 %d\n",data);
+            //     tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, data, 1);
+            // } 
+            // else{
+                // switch(msg_raw->data[0]){
+                //     case 1:{
+                        for(u8 i=1;i<VD_CMD_END;i++)//*循环上报所有的DP //
+                        {
+                            switch(i){//msg_raw->data[i+2]
+                                case VD_CMD_WORK_MODE:{
+                                    u8 lightmode = app_light_ctrl_data_mode_get_value();
+                                    // if(lightmode == 0 || lightmode == 3)
+                                    // {
+                                        tal_main_debug("lightmode %d\n",lightmode);
+                                        tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &lightmode, 1);
+                                    // }
+
+                                }
+                                break;
+                                case VD_CMD_COUNTDOWN:{//
+                                    u8 countdown_data[7]= {0};
+                                    i =100;
+                                    tal_main_debug("/***********VD_CMD_COUNTDOWN***********/");
+                                    app_tuya_vendor_light_countdown_data(&countdown_data[3]);
+                                    countdown_data[0] = 0x01;
+                                    countdown_data[1] = 0x07;
+                                    countdown_data[2] = 0x02;
+                                    tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &countdown_data, sizeof(countdown_data));
+                                }
+                                     break; 
+                                case VD_CMD_DOWN_TIMER:{//
+                                    u8 countdown_data[7]= {0};
+                                    tal_main_debug("/***********VD_CMD_DOWN_TIMER***********/");
+                                    app_tuya_vendor_light_countdown_data(&countdown_data[3]);
+                                    countdown_data[0] = 0x01;
+                                    countdown_data[1] = VD_CMD_DOWN_TIMER;
+                                    countdown_data[2] = 0x02;
+                                    tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &countdown_data, sizeof(countdown_data));                                
+                                    }
+                                    break;                                     
+                                case VD_CMD_BAT_PERCENT:{//
+                                    u8 Battery_data[7]= {0};
+                                    Battery_data[0] = 0x01;
+                                    Battery_data[1] = VD_CMD_BAT_PERCENT;
+                                    Battery_data[2] = 0x02;//value
+                                    Battery_data[3] = 00;
+                                    Battery_data[4] = 00;
+                                    Battery_data[5] = 00;
+                                    Battery_data[6] = sys_status.cap_percent;
+                                    tal_main_debug("bat_percent %d",sys_status.cap_percent);
+
+                                    tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &Battery_data, sizeof(Battery_data));
+                                    }
+                                    break;      
+                                case VD_CMD_SPECIAL_MODE:{
+                                    // tal_main_debug("/***********VD_CMD_SPECIAL_MODE***********/");
+
+                                    u8 mode_data[4]= {0};
+                                    mode_data[0] = 0x01;
+                                    mode_data[1] = VD_CMD_SPECIAL_MODE;
+                                    mode_data[2] = 0x04;    
+                                    mode_data[3] = app_light_user_mode_get_value();  
+                                    tal_main_debug("special_mode %d",mode_data[3]); 
+
+                                    tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &mode_data, sizeof(mode_data));                       
+                                }   
+                                 break;    
+                                case VD_CMD_EN_SLEEP:{
+                                     tal_main_debug("/***********VD_CMD_EN_SLEEP***********/");
+
+                                    u8 sleep_status[4]= {0};
+                                    sleep_status[0] = 0x01;
+                                    sleep_status[1] = VD_CMD_EN_SLEEP;
+                                    sleep_status[2] = 0x01;    
+                                    sleep_status[3] = sys_status.en_sleep_status;  
+                                    tal_main_debug("sleep_status %d",sleep_status[3]); 
+                                    
+                                    tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &sleep_status, sizeof(sleep_status));                       
+                                }                                   
+                                    break;  
+                                case VD_CMD_EN_GAME:{
+                                    //  tal_main_debug("/***********VD_CMD_EN_GAME***********/");
+
+                                    // u8 game_status[4]= {0};
+                                    // game_status[0] = 0x01;
+                                    // game_status[1] = VD_CMD_EN_GAME;                                    
+                                    // game_status[2] = 0x01;    
+                                    // if (sys_status.output_mode == MODE_GAME)
+                                    // {
+                                    //     game_status[3] = 1;
+                                    // }
+                                    // else
+                                    // {
+                                    //     game_status[3] = 0;
+                                    // }                                      
+                                    // tal_main_debug("game_status %d",game_status[3]); 
+                                    
+                                    // tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &game_status, sizeof(game_status));                       
+                                }                                   
+                                    break;  
+
+                                // case VD_CMD_LIGHT_SPEED:{
+                                //      tal_main_debug("/***********VD_CMD_LIGHT_SPEED***********/");
+
+                                //     u8 speed_status[7]= {0};
+                                //     speed_status[0] = 0x01;
+                                //     speed_status[1] = VD_CMD_LIGHT_SPEED;                                    
+                                //     speed_status[2] = 0x02;    
+                                //     speed_status[3] = 00;
+                                //     speed_status[4] = 00;
+                                //     speed_status[5] = 00;
+                                //     speed_status[6] = Light_Speed_Lv*10;                       
+                                //     tal_main_debug("speed_status %d",speed_status[6]); 
+                                   
+                                //     tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, &speed_status, sizeof(speed_status));                       
+                                // }                                   
+                                //     break;  
+
+
+                                default:
+                                break;
+                            }
+                        }
+                    // }
+                // }
+            // }
+                   
+            break;
+        case TAL_MESH_OPCODE_WRITE:
+        case TAL_MESH_OPCODE_WRITE_UNACK:
+            if(TAL_MESH_OPCODE_WRITE == msg_raw->opcode){
+                tal_mesh_data_send(net_param->dst_addr, net_param->src_addr, TAL_MESH_OPCODE_DATA, msg_raw->data, msg_raw->data_len);
+            }
+            // TAL_PR_HEXDUMP_DEBUG("dp_data",msg_raw->data,msg_raw->data_len);
+//            app_tuya_vendor_set_light_data(net_param->dst_addr, net_param->dst_addr,&(msg_raw->data), msg_raw->data_len);//�Զ���DP[]��ԽӺ���//
+            if(msg_raw->data_len < 2){
+// #if TUYA_SDK_TEST
+//                 tal_sdk_test_mesh_data_write(2, 4, msg_raw->data, 1);
+// #endif
+                OPERATE_RET ret = 1;
+                if(msg_raw->data[0] != app_light_ctrl_data_mode_get_value()){ 
+                    ret = app_light_ctrl_data_mode_set(msg_raw->data[0]); //set mode  LIGHT_MODE_E//   
+                    if(OPRT_OK == ret){
+                        set_local_mode_tuya(app_light_ctrl_data_mode_get_value());
+                        app_light_ctrl_proc();                  
+                    }
+                }
+            }
+            else{
+                    switch(msg_raw->data[0]){
+                    case 1:
+                    {
+                        app_tuya_vendor_light_dp_data(msg_raw->data, msg_raw->data_len);
+                    }
+                    break;
+                    #if LIGHT_CFG_REMOTE_ENABLE
+                    case VD_GROUP_ADDR_SUB:
+                    case VD_REMOTE_LIGHTNESS:
+                    case VD_FAVORITE_SAVE_CMD:{
+                        // ty_light_remote_dp_data(par,par_len);       
+                    }
+                    break;
+                    #endif
+                    case VD_GROUP_ADDR_INQUIRE:{
+                        // app_light_vendor_group_addr_inquire(src_addr, dst_addr);
+                    }
+                    break;
+                    case VD_SCENE_SYNC_CMD:{
+                        u16 sync_group_addr = ((u16)msg_raw->data[2]<<8) + msg_raw->data[3];
+
+                        // if((SCENE_MODE != app_light_ctrl_data_mode_get_value())||(ty_light_scene_cmd_get_groupid() != sync_group_addr)||(par[4] != ty_light_scene_ctrl_get_scenenum())||\
+                        //         (par[5] != ty_light_scene_ctrl_get_unit())){
+                        //     break;
+                        // }
+                        // ty_light_scene_cmd_sync(par[6]);
+                    }
+                    break;
+                    default:
+                    break;
+                }            
+                if(0x02 == msg_raw->data[0]){
+                    tal_utc_date_t date = {0};
+                    UINT32_T unix_time = 0;
+                    INT16_T time_zone = 0;
+                    if(msg_raw->data[2] & 0x04){
+                        unix_time += (msg_raw->data[3] << 24);
+                        unix_time += (msg_raw->data[4] << 16);
+                        unix_time += (msg_raw->data[5] << 8);
+                        unix_time += msg_raw->data[6] & 0xFF;
+                    }
+                    if(msg_raw->data[2] & 0x02){
+                        time_zone += (msg_raw->data[7] << 8);
+                        time_zone += msg_raw->data[8] & 0xFF;
+                    }
+
+                    tal_rtc_time_set(unix_time);
+                    tal_utc_timestamp2date(unix_time, &date, false);
+                    tal_utc_set_time_zone(time_zone);
+
+                    date.year -= 2000;
+#if TUYA_SDK_TEST
+                    tal_sdk_test_get_time_rsp(&date);
+#endif
+                }
+                else if(0x01 == msg_raw->data[0]){
+                    if(0x06 == msg_raw->data[1]){
+                        UINT8_T dp_len = msg_raw->data[3];
+#if TUYA_SDK_TEST
+                        tal_sdk_test_mesh_data_write(6, 3, &msg_raw->data[4], dp_len);
+#endif
+                    }
+                    if(0x07 == msg_raw->data[1]){
+						light_ness = msg_raw->data[5]<<8 | msg_raw->data[6];
+                        TAL_PR_DEBUG("light_ness=%d",light_ness);
+						//duandebug
+                    }					
+                }
+            }
+        break;
+
+        default:
+        break;
+    }
+    if(bActiveFlag) {
+        ////
+        // app_light_ctrl_data_auto_save_start(APP_DATA_AUTO_SAVE_DELAY_TIME);
+        opRet = app_light_ctrl_proc();
+        // if(opRet != LIGHT_OK) {
+        //     APP_LOG("ctrl proc deal error!");
+        // }
+    }
+    return OPRT_OK;
+}
+
+VOID app_ble_data_recv(TAL_BLE_EVT_PARAMS_T *p_event){
+
+        STATIC UINT8_T event_last_type = 0,offflag;
+
+    switch(p_event->type) {
+        case TAL_BLE_EVT_PERIPHERAL_CONNECT:
+            tal_main_debug("BLE connect");
+#if ACTIVE_SLEEP_TEST
+            extern u8 already_conn_phone;
+            extern u16 active_sleep_cnt;
+            extern TIMER_ID repeat_active_sleep_timer_id;
+            void send_bomb_packet_ready();
+
+            already_conn_phone = 1;
+
+            active_sleep_cnt = 0;
+
+            if (repeat_active_sleep_timer_id != NULL) // 不要活性睡眠了
+            {
+                tal_sw_timer_delete(repeat_active_sleep_timer_id);
+                repeat_active_sleep_timer_id = NULL;
+            }
+
+            send_bomb_packet_ready();
+#endif
+            app_ble_connect_state_set(1);
+        break;
+        case TAL_BLE_EVT_DISCONNECT:
+            tal_main_debug("BLE disconnect reason:%x", p_event->ble_event.disconnect.reason);
+            app_ble_connect_state_set(0);
+        break;
+        case TAL_BLE_EVT_ADV_REPORT:
+            tal_rssi_test_ble_adv_recv(p_event->ble_event.adv_report.p_data, p_event->ble_event.adv_report.data_len, 
+                                            p_event->ble_event.adv_report.peer_addr.addr, p_event->ble_event.adv_report.rssi);
+        break;
+        case TAL_BLE_EVT_WRITE_REQ:
+        {
+            if(event_last_type != TAL_BLE_EVT_WRITE_REQ)    // 上一个是非写数据请求  //
+            {
+                tkl_timer_stop(0);
+                tal_sw_timer_stop(countdown_sw_timer);
+            }      
+            tal_ble_ota_data_recv(p_event->ble_event.write_report.report.p_data, p_event->ble_event.write_report.report.len);
+
+            // offflag++;
+            // if(offflag>50)
+            // {
+            //     //重置复位芯片时间
+            //     gpio_write(USER_RST_PIN,0); 
+            //     sleep_ms(2);
+            //     gpio_write(USER_RST_PIN,1); 
+            // }
+            break;
+        }
+        default:
+        break;
+    }
+    event_last_type = p_event->type;    
+}
+
+
+/**
+****************************************************************************************
+ * @description: 
+ * @attention:  
+ * @return {*} OPERATE_RET
+****************************************************************************************
+*/
+OPERATE_RET tuya_init_first(VOID_T)
+{
+    tuya_firmware_config();
+    TAL_UART_CFG_T tal_uart_cfg = {
+        .rx_buffer_size = 256,
+        .open_mode = 0,
+        .base_cfg = {
+#if ENABLE_LOG
+            .baudrate = 115200,
+            // .baudrate = 9600,
+#else
+            .baudrate = 9600,
+#endif
+            .parity = TUYA_UART_PARITY_TYPE_NONE,
+            .databits = TUYA_UART_DATA_LEN_8BIT,
+            .stopbits = TUYA_UART_STOP_LEN_1BIT,
+            .flowctrl = TUYA_UART_FLOWCTRL_NONE,
+        }
+    };
+
+    tal_uart_init(TUYA_UART_NUM_0, &tal_uart_cfg);
+    tal_uart_rx_reg_irq_cb(TUYA_UART_NUM_0, tuya_uart_irq_rx_cb);
+#if ENABLE_LOG
+    tal_log_create_manage_and_init(TAL_LOG_LEVEL_DEBUG, 256, tuya_log_output_cb);
+#endif
+
+    USER_RST_INIT();
+
+    tal_rtc_init();
+    return OPRT_OK;
+}
+
+
+OPERATE_RET tuya_init_second(VOID_T)
+{
+    tal_main_debug("/************Obulb2 PRO init***********/");
+
+    // tal_sw_timer_start(s_test__timer_id, 100, TAL_TIMER_CYCLE);
+
+
+      UCHAR_T num;
+      num =  tal_get_if_prov_success();
+     tal_main_debug("num:%d", num);
+    // num =  tal_sw_timer_create(test_software_timer2_callback, NULL, &sg_test__timer_id);
+    // tal_main_debug("suncess:%d", num);
+    // num =tal_sw_timer_start(sg_test__timer_id, 500, TAL_TIMER_CYCLE);  
+    // tal_main_debug("suncess:%d", num);  
+    // tal_mesh_network_state_set(MESH_NETWORK_RECOVER);
+    // tal_mesh_node_provision_enable(MESH_PROVISION_DISABLE);
+    
+    return OPRT_OK;
+}
+
+OPERATE_RET tuya_init_third()
+{
+    tal_element_register(0);
+    tal_model_register(0, TAL_MODEL_ID_GENERIC_ONOFF_SERVER);
+    tal_model_register(0, TAL_MODEL_ID_VENDOR_SERVER);
+    tal_model_register(0, TAL_MODEL_ID_LIGHT_LIGHTNESS_SERVER);
+    tal_model_register(0, TAL_MODEL_ID_LIGHT_CTL_SERVER);
+    tal_model_register(0, TAL_MODEL_ID_LIGHT_CTL_TEMP_SERVER);
+    tal_model_register(0, TAL_MODEL_ID_LIGHT_HSL_SERVER);
+
+    tal_mesh_msg_recv_cb_init(app_mesh_data_recv);//mesh数据接收回调
+    tal_mesh_ble_recv_cb_init(app_ble_data_recv);
+    return OPRT_OK;
+}
+
+
+
+VOID app_mdev_test_get_rssi_callback(TIMER_ID timer_id, VOID_T *arg){
+    int rssi = 0;
+    tal_rssi_base_test_stop(TY_MDEV_RSSI);
+
+    if(OPRT_OK == ty_rssi_base_test_get_rssi_avg(&rssi, TY_MDEV_RSSI)){
+        tal_main_debug("mdev:%d", rssi);
+   }
+}
+
+OPERATE_RET tuya_init_last(VOID_T)
+{
+    if(0 == tal_get_if_prov_success()){
+        tal_rssi_base_test_start(TY_MDEV_RSSI);
+        tal_sw_timer_create(app_mdev_test_get_rssi_callback, NULL, &app_mdev_test_timer_id);
+        tal_sw_timer_start(app_mdev_test_timer_id, 2000, TAL_TIMER_ONCE);
+    }
+
+    UINT32_T interval_ms = 4000;    //*看门狗预设时间 //
+
+    TUYA_WDOG_BASE_CFG_T wdog_cfg = {
+        .interval_ms = interval_ms,
+    };
+    tal_watchdog_start(&wdog_cfg);  //*看门狗启动 // 
+    tkl_timer_deinit(0);            //*定时器0初始化//
+    TUYA_TIMER_BASE_CFG_T timer_cfg ={
+        .mode =  TUYA_TIMER_MODE_PERIOD,
+        .cb = sk6812_isr_handle,
+        .args = NULL,
+    };
+    tkl_timer_init(0,&timer_cfg);  
+    tkl_timer_start(0,5000);        //*定时器0 5MS 开始//
+
+    //直接调试灯光模式
+    // TUYA_GPIO_BASE_CFG_T gpio_cfg={
+    //     .mode = TUYA_GPIO_PULLUP,
+    //     .direct = TUYA_GPIO_OUTPUT,
+    //     .level = TUYA_GPIO_LEVEL_LOW,
+    // };
+    // tal_gpio_deinit(26);
+    // tal_gpio_init(26,&gpio_cfg);
+
+    // 
+    // WS2812BFX_SetSpeed(0,2);// Speed of segment 0
+    // WS2812BFX_SetColorRGB(0, 0,0,0,sys_status.pwm_store_data);
+    // WS2812BFX_SetMode(0, FX_MODE_STATIC);	// Set mode segment 0
+    // WS2812BFX_Start(0);		
+    InitPort(); 
+    WS2812BFX_Init(1);     //*彩灯参数初始化//
+    noah_init_param();     //*参数初始化//
+    //Starting_Cap_Handle(); //*电池容量参数初始化//
+
+    tal_sw_timer_create(app_light_ctrl_countdown_timer_callback, NULL, &countdown_sw_timer); //* 创建软件定时任务 //  
+	
+    return OPRT_OK;
+}
+
+OPERATE_RET tuya_main_loop(VOID_T){
+    tal_watchdog_refresh();
+    WS2812BFX_Callback();
+    Sys_event_handle();    
+    return OPRT_OK;
+}
+
+/**
+****************************************************************************************
+ * @description: 
+ * @param {TAL_MESH_NET_STATE_T} state
+ * @return {*}
+ * @attention:  
+****************************************************************************************
+*/
+extern un8	offflag;
+extern un8  pair_in;
+VOID tal_mesh_state_callback(TAL_MESH_NET_STATE_T state){
+    tal_main_debug("mesh_state:%d", state);
+
+// #if ACTIVE_SLEEP_TEST
+//     extern u8 already_conn_phone;
+//     if (already_conn_phone)
+//     {
+//         tal_main_debug("PHONE_CLEAR_LIST");
+//     }
+//     already_conn_phone = 0;
+// #endif
+
+    static char LastMeshStat = 0xFF;
+    if(LastMeshStat != state) {
+        switch(state) {
+            case NODE_POWER_ON_UNPROVISION://上电后处于未配网状态//
+                tal_mesh_node_provision_enable(MESH_PROVISION_DISABLE);//关闭广播，不允许配网//
+                set_mesh_prov_state(0);//设置已配网状态0//
+                set_rec_mesh_state(0);//设置已配网恢复状态0//
+                break;
+            case NODE_POWER_ON_IN_MESH://上电后处于已配网状态//
+                // tal_mesh_network_state_set(MESH_NETWORK_RECOVER);
+                set_mesh_prov_state(1);//设置已配网状态1//
+                set_rec_mesh_state(1);//设置已配网恢复状态1//
+                break;
+            case NODE_PROVISION_SUCCESS://配网成功//
+                pair_in=0;
+                set_mesh_prov_state(1);
+                set_rec_mesh_state(1);
+                sys_status.end_30s_mesh = 0;
+                gpio_write(EN_RGB,0);
+                all_off_sk6812();            
+                break;
+            case NODE_KICK_OUT:
+                // tal_mesh_node_provision_enable(MESH_PB_GATT_AND_PB_ADV);
+                // tal_mesh_network_state_set(MESH_NETWORK_RESET);
+                set_mesh_prov_state(0);
+                set_rec_mesh_state(0);
+                sys_status.output_mode = MODE_OFF;	
+                app_light_ctrl_data_switch_set(0);	
+                sys_status.en_mesh_time = 1800;//30S//	
+                // reset_dev_mode(); //�ָ���������//	
+                // set_flash_time_reset();
+                break;
+            case NODE_MESH_RESET:
+                set_mesh_prov_state(0);
+                pair_in=0;
+                if(offflag==0)
+                {
+                    sys_status.en_mesh_time = 1800;//30S//	
+                }	
+                sys_status.output_mode = MODE_OFF;
+                // reset_dev_mode(); //�ָ���������//	
+                // set_flash_time_reset();                
+                break;
+            case NODE_RECOVER_IN_MESH:
+                break;
+            case TY_OTA_START:
+                // tal_main_debug("/************TY_OTA_START***********/");
+                break;
+            case TY_OTA_SUCCESS:
+            case TY_OTA_FAIL:
+                // tal_main_debug("/************TY_OTA_FAIL***********/");
+                break;
+            case TY_GROUP_SUB_ADD:
+                break;
+            case TY_GROUP_SUB_DEL:
+                break;
+            default:
+                break;
+        }
+        LastMeshStat = state;
+    }    
+}
+
+/**
+ * @brief      This function serves to interrupt 
+ * @param[in]  none.
+ * @return     none. 
+ * must  _attribute_ram_code_mam
+ */
+_attribute_ram_code_ VOID sk6812_isr_handle(VOID)
+{
+    static UINT32_T debug_5ms_cnt = 0;
+    sys_time.time_5ms = 1;  //5MS//
+    // if(!sys_status.en_mesh_time)//*配网闪灯不检测通信协议部分，避免闪灯//
+    // {
+    //     Voltage_Pulse_Handle();   
+    // }    
+    if (++debug_5ms_cnt >= 2)
+    {
+        debug_5ms_cnt = 0;
+        sys_time.time_10ms = 1;
+        sys_time.time_100ms_cnt++;
+        if (sys_time.time_100ms_cnt >= 10)//100ms
+        {
+            sys_time.time_100ms_cnt = 0;
+            sys_time.time_100ms = 1;
+            
+            sys_time.time_1s_cnt++;
+            if(sys_time.time_1s_cnt>=10)
+            {
+                sys_time.time_1s_cnt = 0;
+
+                sys_time.time_1s = 1;
+            }
+        }
+    }        
+    // WS2812BFX_Delay_Handle();
+    if (send_data_trig)
+    {
+        send_data_trig = 0;
+        // tal_main_debug("send_data_trig:%d", send_data_trig);
+        for (UINT16_T i=0;i<=(PIXEL_NUM - 1);i++)
+        {
+            WS2812WR(i,pixelBuffer[i]);
+        }
+    }
+
+     
+     
+
+
+    
+
+    //   tal_gpio_write(26,debug_5ms_cnt%2);
+}
+
+/**
+ * @brief      This function serves to set ws2812 1
+ * @param[in]  none.
+ * @return     none.
+ */
+static inline void skc6812_logic1(void)
+{
+	gpio_write(SK6812_DATA, 1);
+	CLOCK_DLY_600NS;
+    CLOCK_DLY_200NS;
+    CLOCK_DLY_100NS;//---增加//
+	gpio_write(SK6812_DATA, 0);
+	CLOCK_DLY_100NS;
+    // CLOCK_DLY_100NS;
+    
+}
+
+/**
+ * @brief      This function serves to set ws2812 0
+ * @param[in]  none.
+ * @return     none.
+ */
+
+static inline void skc6812_logic0(void)
+{
+	gpio_write(SK6812_DATA, 1);
+	CLOCK_DLY_100NS;
+    CLOCK_DLY_100NS;
+    CLOCK_DLY_100NS; //---增加//
+	gpio_write(SK6812_DATA, 0);
+	CLOCK_DLY_200NS;
+	CLOCK_DLY_200NS;
+    CLOCK_DLY_200NS;
+    CLOCK_DLY_100NS;//---增加//
+}
+
+
+
+/**
+****************************************************************************************
+ * @description: 
+ * @param {UINT16_T} leds
+ * @param {UINT32_T} color
+ * @attention:  
+ * @return {*}
+****************************************************************************************
+*/
+static inline void WS2812WR(UINT16_T leds ,UINT32_T color)
+{
+	UINT8_T color_num=3,dat,i=8;
+	UINT8_T g_color=0,r_color=0,b_color=0,w_color=0;
+	if (leds >= PIXEL_NUM)//80led//
+	{
+		return ;
+	}
+	g_color = ((color>>16)&0x0000FF);
+	r_color = ((color>>8)&0x0000FF);
+	b_color = (color&0x0000FF);
+//	DO=0;
+	//32 BITSKC6812 GRBW//
+	while(color_num--)
+	{
+	  if(color_num==2)dat=g_color;
+	  if(color_num==1)dat=r_color;
+	  if(color_num==0)dat=b_color;
+
+        while(i--)
+        {
+            if(dat & 0X80)
+            {
+                skc6812_logic1();
+            }
+            else
+            {
+                skc6812_logic0();
+            }
+                dat <<= 1;
+        }
+        i=8;
+  }
+}
+
+
+
+
+
+
+/**
+ * @brief: set light switch data, adapte control data issued by system
+ *          to control data format.设置电灯开关数据，适应系统发出的控制数据 控制数据格式。
+ * @param {IN bool bONOFF -> switch data, TRUE will turn on} 
+ * @retval: OPERATE_LIGHT -> LIGHT_OK meaning need to call app_light_ctrl_proc() function!
+ */
+OPERATE_RET app_light_ctrl_data_switch_set(IN bool bONOFF)
+{   
+    bool bLastStatus ;
+
+    bLastStatus = tLightCtrlData.bSwitch;
+
+    if( TRUE == bONOFF ) {
+        tLightCtrlData.bSwitch = TRUE;
+         
+        if(SCENE_MODE == tLightCtrlData.eMode) {              /* restart scene mode */
+            // ty_light_scene_ctrl_firstset(TRUE);     //从头开始设置灯光场景//
+        }
+    } else {
+        tLightCtrlData.bSwitch = FALSE;
+    }
+    
+    if(bONOFF == bLastStatus) {
+        // TY_LOG_DEBUG("the same switch set");
+        return OPRT_NETWORK_ERROR ;
+    }
+    
+    return OPRT_OK;
+}
+
+
+/**
+ * @brief: set light mode data
+ * @param {IN LIGHT_MODE_E eMode} 
+ * @attention: Mode value is below:
+ *                                  WHITE_MODE = 0,
+ *                                  COLOR_MODE = 1,
+ *                                  SCENE_MODE = 2,
+ *                                  MUSIC_MODE = 3,
+ * @retval: OPERATE_LIGHT -> LIGHT_OK meaning need to call app_light_ctrl_proc() function!
+ */
+OPERATE_RET app_light_ctrl_data_mode_set(IN LIGHT_MODE_E eMode)
+{   
+	OPERATE_RET opRet = 1;
+    LIGHT_MODE_E eLastMode ;
+
+    eLastMode = tLightCtrlData.eMode;
+
+    /* mode set need limit when light way is RGB, or CW or C */
+    if(eMode > MODE_MAX) {
+
+        return OPRT_NETWORK_ERROR;
+    }
+    
+    TAL_PR_DEBUG("eMode:%d", tLightCtrlData.eMode);
+    tLightCtrlData.eMode = eMode;
+    
+    if((eMode == eLastMode) && (eMode != SCENE_MODE)) {      /* only scene mode can be set many time */
+        // TY_LOG_DEBUG("the same mode set");
+        return OPRT_INVALID_PARM;
+    }
+
+    /* don't need to proc, as the adjusted new scene control data will issued later  */
+    if((eMode == SCENE_MODE) && (tLightCtrlData.ucRealTimeFlag == TRUE)) { 
+
+        return OPRT_INVALID_PARM;
+    }
+
+    if(SCENE_MODE == tLightCtrlData.eMode) {              /* restart scene mode */
+        // ty_light_scene_ctrl_firstset(TRUE);     //��ͷ��ʼ���õƹⳡ��//
+    }
+    
+    return OPRT_OK;
+}
+
+/**
+ * @brief: set light bright data, adapte control data issued by system
+ *          to control data format.
+ * @param {IN u16 usBright} 
+ * @attention: acceptable range:2~255
+ * @attention: set bright value, will auto set the Mode to WHITE_MODE !
+ * @retval: OPERATE_LIGHT -> LIGHT_OK meaning need to call app_light_ctrl_proc() function!
+ */
+OPERATE_RET app_light_ctrl_data_bright_set(IN u16 usBright)
+{   
+    if(((usBright < CTRL_CW_BRIGHT_VALUE_MIN) || (usBright > CTRL_CW_BRIGHT_VALUE_MAX)) ){
+        // TY_LOG_ERR("bright value is exceed range,set error");
+        return OPRT_INVALID_PARM;
+    }
+    
+    tLightCtrlData.usBright = usBright;
+    tLightCtrlData.eMode = WHITE_MODE;    /* change mode to white mode forcibly */
+
+    return OPRT_OK;
+}
+
+/**
+ * @brief: get light switch data
+ * @param {OUT bool *pONOFF -> switch data return} 
+ * @retval: OOPERATE_RET
+ */
+bool app_light_ctrl_data_switch_get(void)
+{
+    return tLightCtrlData.bSwitch;
+}
+
+
+/**
+ * @berief: get light mode data ��ȡģʽ����
+ * @param {OUT LIGHT_MODE_E *Mode -> mode data return} 
+ *                                    typedef enum{
+ *                                        WHITE_MODE = 0,
+ *                                        COLOR_MODE,
+ *                                        SCENE_MODE,
+ *                                        MUSIC_MODE,
+ *                                       MODE_MAX,
+ *                                    }LIGHT_MODE_E;
+ * @retval: OOPERATE_RET
+ */
+u8 app_light_ctrl_data_mode_get_value(void)
+{
+    return tLightCtrlData.eMode;
+}
+
+
+
+u8 app_light_user_mode_get_value(void)
+{
+    return tLightCtrlData.user_mode;
+    // TAL_PR_DEBUG("mo %d",tLightCtrlData.user_mode);
+}
+
+/**
+****************************************************************************************
+ * @description: app set mode
+ * @param {u8} mode 
+ * @attention:   
+ * @return {*}
+****************************************************************************************
+*/
+void app_light_user_mode_set_value(u8 mode)
+{
+    tLightCtrlData.user_mode = mode;
+    // TAL_PR_DEBUG("mo %d",tLightCtrlData.user_mode); //wudebug
+}
+
+/*--------------------------------
+opcode  
+--------------------------------*/
+
+/**
+* @description: tuya vendor light dp-data handle
+* @param[in] {u8 *par} data
+* @param[in] {int par_len} data length
+* @return:none rx dp handle
+**/
+u8   music_tr;
+
+void app_tuya_vendor_light_dp_data(u8 *par, int par_len){
+    uint8_t     dp_tr;
+
+    if((par[1]==VD_CMD_MUSIC_DATA)&&(music_tr!=1))
+    {
+        music_tr=1;
+        TAL_PR_DEBUG("MUSIC_TR SET");
+        set_local_mode_tuya(app_light_ctrl_data_mode_get_value());    
+    }
+
+    switch(par[1]){
+        case VD_CMD_SCENE_DATA:{
+
+            }
+            break;
+        case VD_CMD_COUNTDOWN:{
+                u32 Countdown_time=0;
+                Countdown_time = par[3];
+                Countdown_time = (Countdown_time<<8) + par[4];
+                Countdown_time = (Countdown_time<<8) + par[5];
+                Countdown_time = (Countdown_time<<8) + par[6];
+                tal_main_debug("Countdown_time %d\n",Countdown_time);
+                count_time_status = 1;
+                 app_light_ctrl_data_countdown_set(Countdown_time);              
+        }break;
+        case VD_CMD_MUSIC_DATA:{
+                char music_buffer[22] = {0};
+                u32 len = par[3];
+
+                // tal_main_debug("par[4] %s\n",par[4]);
+                if(len!= 4)
+                {
+                    break;
+                }
+
+                OPERATE_RET opRet = 1;
+                
+                opRet = ty_light_basis_tools_music_data_decompress(&par[4], len, &music_buffer);
+
+
+                if(OPRT_OK != opRet)
+                {
+                    break;
+                }
+                opRet = app_light_ctrl_data_realtime_adjust_set(TRUE,music_buffer);
+                // tal_main_debug("opRet %d\n",opRet);
+                if(OPRT_OK != opRet)
+                {
+                    break;
+                }
+                app_light_real_time_ctrl_proc();
+                
+            }
+            break;
+        case VD_CMD_POWER_MEMORY:{//power_memory
+            }
+            break;
+        case VD_CMD_DONT_DISTURB:{//do_not_disturb  value = int
+
+            }
+            break;
+
+        case VD_CMD_DOWN_TIMER:{
+                u32 Countdown_time=0;
+                Countdown_time = par[3];
+                Countdown_time = (Countdown_time<<8) + par[4];
+                Countdown_time = (Countdown_time<<8) + par[5];
+                Countdown_time = (Countdown_time<<8) + par[6];
+                count_time_status = 0;
+                tal_main_debug("Countdown_time %d\n",Countdown_time);
+                app_light_ctrl_data_countdown_set(Countdown_time);              
+            }
+            break;
+
+        case VD_CMD_SPECIAL_MODE:{   
+                
+                OPERATE_RET ret = 1;
+                
+                // if((par[3]) != app_light_user_mode_get_value()){ 
+                    app_light_ctrl_data_switch_set(1);
+                    tal_main_debug("par[3] %d\n",par[3]);
+                    app_light_ctrl_data_mode_set(COLOR_MODE);//* 强制设置为颜色模式//
+                    app_light_user_mode_set_value(par[3]);
+                    set_local_mode_tuya(app_light_ctrl_data_mode_get_value());//*涂鸦同步到本地//
+                    app_light_ctrl_proc();                  
+                // }                
+            }
+            break;
+        case VD_CMD_EN_SLEEP:{   
+                sys_status.en_sleep_status = par[3];
+                set_flash_time_reset();
+                // if(sys_status.output_mode != MODE_OFF)
+                // {
+                    
+				// 	gpio_write(EN_RGB,0);          //IC  DISABLE OFF  //
+	    		// 	sleep_us(20000);    
+                //     gpio_write(EN_RGB,1);          //IC  DISABLE OFF  //                
+                // }
+                tal_main_debug("en_sleep_status %d\n",sys_status.en_sleep_status);
+                              
+            }            
+          
+            break;
+        case VD_CMD_LIGHT_CHARGE:{   
+                sys_status.en_charge_light_status = par[3];
+            }
+            break;
+        case VD_CMD_EN_GAME:{   
+                // u8 game_mode_on = par[3];
+                // if (game_mode_on)
+                // {
+                //     app_light_ctrl_data_switch_set(1);
+                //     app_light_ctrl_data_onoff_response(tLightCtrlData.bSwitch);     /* opload after ctrl deal with */
+                //     set_game_mode();
+                // }
+                // else
+                // {
+                //     app_light_ctrl_data_switch_set(1);
+                //     app_light_ctrl_data_onoff_response(tLightCtrlData.bSwitch);     /* opload after ctrl deal with */
+                //     sys_status.output_mode = sys_status.output_mode_memory;
+                //     app_light_ctrl_proc();  
+                // }
+                
+                // sys_status.en_sleep_status = par[3];
+                
+                              
+            }            
+          
+            break;            
+        case VD_CMD_EN_RESET:{   
+
+                // tal_main_debug("reset_on %d\n",reset_on);
+                    gpio_write(EN_RGB,0);
+                    all_off_sk6812();
+                    light_onoff_moment(0,0,0); //1.6 --- 12-22改写 
+                    light_moment_HSV(0,0,0,0,0);//1.6 --- 12-22改写
+                    sys_status.output_mode = MODE_OFF;
+                    app_light_ctrl_data_switch_set(0);
+                    app_light_ctrl_data_onoff_response(tLightCtrlData.bSwitch);
+                     sys_status.reset_mode_led = 1;	         
+                    reset_dev_mode(); //复位设备模式顺序//					
+                    set_flash_time_reset();                
+                    app_light_ctrl_data_mode_response();//1.6 --- 上传模式数据//
+                    break;     
+            }            
+        // case VD_CMD_LIGHT_SPEED:{
+        //             dp_tr=par[6]/10;
+        //             (dp_tr<1)?(dp_tr=1):(0);
+        //             (dp_tr>5)?(dp_tr=5):(0);
+        //             Light_Speed_Lv=dp_tr;
+        //             TAL_PR_DEBUG("dp_tr=%d",dp_tr);
+        //             break;
+        //     }       
+       
+        default:
+            break;
+    }
+}
+
+
+/**
+ * @brief: Light control proc
+ * @param {none}
+ * @retval: OPERATE_LIGHT
+ */
+OPERATE_RET app_light_ctrl_proc(void)
+{
+    OPERATE_RET opRet = 1;
+    u32 uiCycleTime = 0;
+    bool bEableFlag = 0;
+    static bool bLastSwitchStatus = FALSE;
+    u8 sence_uint = 0;
+    u8 sence_id = 0;
+
+    tal_main_debug("bSwitch %d\n",tLightCtrlData.bSwitch);
+    TAL_PR_DEBUG("EMODE = %d",tLightCtrlData.eMode);
+    if(tLightCtrlData.bSwitch == FALSE) {  /* onoff ctrl state -- turn off */
+                
+        switch(tLightCtrlData.eMode)
+        {
+            case WHITE_MODE: //off state  set white is zero
+
+                //light_onoff_slow(0,0);
+				sys_status.app_contrl_change = 1;//duandebug
+				light_onoff_HSV(0,0,0,0);//duandebug
+                break;
+                
+            case COLOR_MODE:
+                sys_status.app_contrl_change = 1;
+                light_onoff_HSV(0,0,0,0);
+                break;
+                
+            case SCENE_MODE:
+                break;
+
+            case MUSIC_MODE:
+
+                 light_onoff_HSV(0,0,0,0);
+                break;
+                
+            default:
+                gpio_write(EN_RGB,0);    
+                light_moment_HSV(0,0,0,0,0);
+                break;
+        }
+
+        
+
+    } else {    /* onoff ctrl state -- turn on */ 
+
+//         TY_LOG_DEBUG("current mode %d", tLightCtrlData.eMode);
+        
+         if(tLightCtrlData.eMode == SCENE_MODE) {
+            
+         } else if(tLightCtrlData.eMode == MUSIC_MODE) {   /* mode is music mode!!!! */ /* this mode only appear turn on firstly */
+//             ty_light_scene_ctrl_change_stop();
+
+//             LIGHT_CTRL_DATA_T tMusicCtrlData;
+//             memset(&tMusicCtrlData, 0, sizeof(LIGHT_CTRL_DATA_T));
+//             memcpy(&tMusicCtrlData, &tLightCtrlData, sizeof(LIGHT_CTRL_DATA_T));     /* make sure music mode restart as red color */
+//             memset(&tCtrlData, 0, sizeof(BRIGHT_DATA_T));  /* set target contol data!!! */
+
+//             tMusicCtrlData.tColor.usRed = CTRL_CAL_VALUE_RANGE;
+//             tMusicCtrlData.tColor.usGreen = 0;
+//             tMusicCtrlData.tColor.usBlue = 0;
+            
+//             app_ty_light_gradual_ctrl_calc_rgbcw(tLightCtrlData.eMode,  &tMusicCtrlData, &tCtrlData);
+
+//             ty_light_gradual_ctrl_targetset(RGB_MODE,&tCtrlData);
+//             params.eMode = NORMAL_MODE;
+//             olight_ctrl_targetset(RGB_MODE,&tCtrlData);//noah  added ctrl light use//
+//             ty_light_gradual_ctrl_start(&params);
+                tal_main_debug("MUSIC_MODE");
+                gpio_write(EN_RGB,1);
+                light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);            
+         } else {    /* mode is not scene and music mode ,mode is white or color mode ! */
+
+            switch (tLightCtrlData.eMode) //min value is 0
+            {
+            case WHITE_MODE:
+                pwm_out_ctrl(sys_status.pwm_store_data * 1000 / 255);    
+                gpio_write(EN_RGB,0);                      
+                gpio_write(EN_WHITE_PIN,1);   
+                light_onoff_slow(0,sys_status.pwm_store_data);  
+                TAL_PR_DEBUG("SET WHITE LIGHT=%d",sys_status.pwm_store_data);
+                break;
+            case COLOR_MODE:
+                 tal_main_debug("dev_Mode %d\n",app_light_user_mode_get_value());
+                 tal_main_debug("output_mode %d\n",sys_status.output_mode);
+                switch (app_light_user_mode_get_value())
+                {                              
+                    // case FIRE_MODE:
+                    //     // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                    //     light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                    //     break;  
+
+                    case FLASH_MODE:    //wudebug
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);                        
+                        break;  
+
+                    case RAINBOW_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case RANDOM_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case FIREWORK_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case ROTATE_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;                
+                        
+                    case RUN_RG_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;                
+                    case TWINKLE_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case STATIC_MODE:
+                        light_onoff_HSV(0,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data); 
+                        break;  
+                                   
+                    // case FLASH_MODE:
+                    //     // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                    //     light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);                        
+                    //     break;  
+
+                    case FIRE_MODE:     //wudebug
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;   
+                    case TRICOLOR_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case BLACKOUT_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case RUNING_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case SPHERE_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case COLOURS_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;    
+                    case ICU_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;   
+                    case GRADIENT_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;     
+                    case GRAD_BLUE_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case GRAD_PINK_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case GRAD_GREEN_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case GRAD_YELLOW_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;
+                    case GRAD_SUNSET_MODE:
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;        
+                    case GRAD_SKY_MODE:
+                    case GRAD_NewYear_MODE:
+                    case GRAD_Christmas_MODE:
+                    case GRAD_Autumn_MODE:    
+                    case GRAD_GhostFire_MODE:
+                    case GRAD_Zombie_MODE:
+                    case GRAD_Snowfall_MODE:  
+                    case GRAD_MaxPurple_MODE:      
+                    case GRAD_WhiteMan_MODE:  
+                    case GRAD_GreenMan_MODE:    
+                    case GRAD_SnowHouse_MODE:                                                                
+                        // light_moment_HSV(0,1,sys_status.color_lightness_data,0,255);
+                        light_moment_HSV(0,1,sys_status.color_lightness_data,sys_status.color_hub_data,sys_status.color_sat_data);
+                        break;                                                                                                                                                                                                                                                                                                              
+                
+                default:
+                    break;
+                }        
+                gpio_write(EN_RGB,1);
+                break;
+            case SCENE_MODE:
+                
+                break;
+            case MUSIC_MODE:
+
+                break; 
+                
+                 
+                                                                                                                                             
+          
+            default:
+                break;
+            }
+        } 
+
+     }
+
+    bLastSwitchStatus = tLightCtrlData.bSwitch;
+    
+    return OPRT_OK;
+}
+
+/**
+ * @brief: LOCAL MODE TO APP mode 
+ * @param :  local mode 
+ * @retval: none
+ */
+void tuya_set_local_mode(u8 mode)//  //
+{
+    switch (mode)
+    {
+    case MODE_WHITE:
+        
+        app_light_ctrl_data_mode_set(WHITE_MODE);
+        break;
+    case MODE_RED_FLASH:    //wudebug
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        // app_light_user_mode_set_value(FLASH_MODE);
+        app_light_user_mode_set_value(FIRE_MODE);
+        break;
+    case MODE_RAINBOW:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(RAINBOW_MODE);
+        break;
+    case MODE_RANDOM_COLOR:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(RANDOM_MODE);
+        break;
+    case MODE_FIREWORK:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(FIREWORK_MODE);
+        break;
+    case MODE_ROTATE_GREEN:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(ROTATE_MODE);
+        break;
+    case MODE_TWINKLE:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(TWINKLE_MODE);
+        break;
+    case MODE_RUN_RG:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(RUN_RG_MODE);
+        break;
+    case MODE_COLOR:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(STATIC_MODE);
+        break;          
+    // case MODE_RED_FLASH:
+        
+    //     app_light_ctrl_data_mode_set(COLOR_MODE);
+    //     app_light_user_mode_set_value(FLASH_MODE);
+    //     break;     
+    case MODE_FIRE:     //wudebug
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        // app_light_user_mode_set_value(FIRE_MODE);
+        app_light_user_mode_set_value(FLASH_MODE);
+        break;   
+
+    case MODE_TRICOLOR:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(TRICOLOR_MODE);
+        break;      
+    case MODE_BLACKOUT:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(BLACKOUT_MODE);
+        break;        
+    case MODE_RUNING:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(RUNING_MODE);
+        break;   
+    case MODE_SPHERE:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(SPHERE_MODE);
+        break;  
+    case MODE_COLOURS:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(COLOURS_MODE);
+        break;            
+    case MODE_ICU:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(ICU_MODE);
+        break;          
+    case MODE_GRADIENT:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRADIENT_MODE);
+        break;                                                                                       
+    case MODE_BLUE:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_BLUE_MODE);
+        break;
+
+    case MODE_PINK:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_PINK_MODE);
+        break;
+
+    case MODE_GREEN:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_GREEN_MODE);
+        break;
+    case MODE_YELLOW:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_YELLOW_MODE);
+        break;
+
+    case MODE_SUNSET:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_SUNSET_MODE);
+        break;
+
+    case MODE_SKY:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_SKY_MODE);
+        break;  
+
+    case MODE_NewYear:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_NewYear_MODE);
+        break;
+
+    case MODE_Christmas:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_Christmas_MODE);
+        break;
+
+    case MODE_Autumn:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_Autumn_MODE);
+        break;      
+
+    case MODE_GhostFire:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_GhostFire_MODE);
+        break;
+
+    case MODE_Zombie:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_Zombie_MODE);
+        break;
+
+    case MODE_Snowfall:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_SnowHouse_MODE);
+        break;   
+
+    case MODE_MaxPurple:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_MaxPurple_MODE);
+        break;   
+
+    case MODE_WhiteMan:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_WhiteMan_MODE);
+        break;   
+
+    case MODE_GreenMan:
+        
+        app_light_ctrl_data_mode_set(COLOR_MODE);
+        app_light_user_mode_set_value(GRAD_GreenMan_MODE);
+        break;   
+
+
+    default:
+        break;
+    }
+	
+}
+/**
+****************************************************************************************
+ * @brief:  app mode synchronous to local mode
+ * @param[in]  USER_MODE_E  APP MODE
+ * @attention:  ǰ��8��ģʽ����Ӧ�ļ������ģʽ�����䣻
+ * @return {*}
+****************************************************************************************
+*/
+void set_local_mode_tuya(u8 mode)   //APP mode TO LOCAL MODE //
+{
+    sys_status.app_contrl_change = 0;
+	switch (mode)
+	{
+	case 0:
+		sys_status.output_mode = MODE_WHITE;
+		sys_status.output_mode_memory = sys_status.output_mode;
+        TAL_PR_DEBUG("set white mode");
+		break;
+
+	case 1:
+        switch (app_light_user_mode_get_value())
+        {
+
+        case FIRE_MODE:    //wudebug
+            sys_status.output_mode = MODE_RED_FLASH;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break; 
+
+        case RAINBOW_MODE:
+            sys_status.output_mode = MODE_RAINBOW;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case RANDOM_MODE:
+            sys_status.output_mode = MODE_RANDOM_COLOR;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case FIREWORK_MODE:
+            sys_status.output_mode = MODE_FIREWORK;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case ROTATE_MODE:
+            sys_status.output_mode = MODE_ROTATE_GREEN;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case TWINKLE_MODE:
+            sys_status.output_mode = MODE_TWINKLE;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case RUN_RG_MODE:
+            sys_status.output_mode = MODE_RUN_RG;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case STATIC_MODE:
+            sys_status.output_mode = MODE_COLOR;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case FLASH_MODE :     //wudebug
+            sys_status.output_mode = MODE_FIRE;
+            // sys_status.output_mode_memory = sys_status.output_mode;
+            break;
+
+        case TRICOLOR_MODE:
+            sys_status.output_mode = MODE_TRICOLOR;
+            break;
+        case BLACKOUT_MODE:
+            sys_status.output_mode = MODE_BLACKOUT;
+            break; 
+
+        case RUNING_MODE:
+            sys_status.output_mode = MODE_RUNING;
+            break;     
+
+        case SPHERE_MODE:
+            sys_status.output_mode = MODE_SPHERE;
+            break; 
+
+        case COLOURS_MODE:
+            sys_status.output_mode = MODE_COLOURS;
+            break; 
+
+        case ICU_MODE:
+            sys_status.output_mode = MODE_ICU;
+            break;     
+
+        case GRADIENT_MODE:
+            sys_status.output_mode = MODE_GRADIENT;
+            break;            
+        case GRAD_BLUE_MODE:
+            sys_status.output_mode = MODE_BLUE;
+            break;  
+        case GRAD_PINK_MODE:
+            sys_status.output_mode = MODE_PINK;
+            break;  
+        case GRAD_GREEN_MODE:
+            sys_status.output_mode = MODE_GREEN;
+            break;  
+        case GRAD_YELLOW_MODE:
+            sys_status.output_mode = MODE_YELLOW;
+            break;  
+        case GRAD_SUNSET_MODE:
+            sys_status.output_mode = MODE_SUNSET;
+            break;  
+        case GRAD_SKY_MODE:
+            sys_status.output_mode = MODE_SKY;
+            break;                                                                                                                                                                                                                       
+        
+        case GRAD_NewYear_MODE:
+            sys_status.output_mode = MODE_NewYear;
+            break;  
+        case GRAD_Christmas_MODE:
+            sys_status.output_mode = MODE_Christmas;
+            break;  
+        case GRAD_Autumn_MODE:
+            sys_status.output_mode = MODE_Autumn;
+            break;  
+        case GRAD_GhostFire_MODE:
+            sys_status.output_mode = MODE_GhostFire;
+            break;  
+        case GRAD_Zombie_MODE:
+            sys_status.output_mode = MODE_Zombie;
+            break;  
+        case GRAD_Snowfall_MODE:
+            sys_status.output_mode = MODE_Snowfall;
+            break;   
+        case GRAD_MaxPurple_MODE:
+            sys_status.output_mode = MODE_MaxPurple;
+            break;  
+        case GRAD_WhiteMan_MODE:
+            sys_status.output_mode = MODE_WhiteMan;
+            break;   
+        case GRAD_GreenMan_MODE:
+            sys_status.output_mode = MODE_GreenMan;
+            break;  
+        case GRAD_SnowHouse_MODE:
+            sys_status.output_mode = MODE_Snowfall;
+            break;  
+        default:
+            break;
+        }   
+
+        // if(app_light_user_mode_get_value()==GRAD_SUNSET_MODE)
+        // {
+        //     break;
+        // }
+        // if(app_light_user_mode_get_value()==FIRE_MODE)
+        // {
+        //     break;
+        // }
+
+        TAL_PR_DEBUG("GET OUTPUT MODE =%d,MEMORY=%d",sys_status.output_mode,sys_status.output_mode_memory);
+        app_replace_localmode(sys_status.output_mode);
+		// sys_status.output_mode = MODE_COLOR;
+		// sys_status.output_mode_memory = sys_status.output_mode;
+		break;
+
+	case 2:
+		// sys_status.output_mode = 11;
+		break;
+
+	case 3:
+		 sys_status.output_mode = MODE_MAX_DEV+1;//坑人
+         sys_status.output_mode_memory = MODE_COLOR;        
+		break;				
+
+	default:
+		break;
+	}
+}
+
+/**
+ * @brief: set light countdown value
+ * @param {IN INT_T uiCountDownSec -> unit:second} 
+ * @attention: countdown lave time will return with 
+ *              switch status will return with calling
+ *              vLightCtrlDataSwitchRespone function when countdown active.
+ * @retval: OPERATE_RET -> LIGHT_OK set countdown OK.
+ */
+OPERATE_RET app_light_ctrl_data_countdown_set(IN u32 uiCountDownSec)
+{
+    OPERATE_RET opRet = 1;
+    
+    if((uiCountDownSec < 0)|| (uiCountDownSec > 86400)){
+        tal_main_debug("Set countdwon value error!");
+        return OPRT_INVALID_PARM;
+    }
+    sys_status.idle_times = 0;//�������߼�ʱ//
+    tLightCtrlData.uiCountDown = uiCountDownSec;
+    if(uiCountDownSec <= 0) {
+        opRet = tal_sw_timer_stop(countdown_sw_timer);      /* cancel coutdown proc */
+        if(opRet != OPRT_OK) {
+            tal_main_debug("Stop countdown timer error!");
+        }
+        return OPRT_OK;
+
+    } else {
+        // opRet = ty_light_basis_sw_timer_start(COUNTDOWN_SW_TIMER, 1000, (void*)app_light_ctrl_countdown_timer_callback);
+        opRet = tal_sw_timer_start(countdown_sw_timer, 1000, TAL_TIMER_ONCE);
+        if(opRet != OPRT_OK) {
+            tal_main_debug("Start countdown timer error!");
+        }
+    }
+    return OPRT_OK;
+}
+
+/**
+****************************************************************************************
+ * @brief: countdown timer callback event
+ * @param[in] TIMER_ID timer_id
+ * @param[in] VOID_T *arg
+ * @attention: countdown finsh on/OFF LIGHT 
+ * @return {*}
+****************************************************************************************
+*/
+VOID_T app_light_ctrl_countdown_timer_callback(TIMER_ID timer_id, VOID_T *arg)
+{
+    OPERATE_RET opRet = 1;
+    u8 countdown_data[7]= {0};
+//wudebug
+    if(tLightCtrlData.uiCountDown > 1) {    /* to avoid ulCountDown = 0 %60 also equal to 0 */
+
+        countdown_data[0] = 0x01;
+        countdown_data[1] = 0x07;
+        countdown_data[2] = 0x02;
+        countdown_data[3] = (tLightCtrlData.uiCountDown>>24)&0xff;
+        countdown_data[4] = (tLightCtrlData.uiCountDown>>16)&0xff;
+        countdown_data[5] = (tLightCtrlData.uiCountDown>>8)&0xff;
+        countdown_data[6] = (tLightCtrlData.uiCountDown>>0)&0xff;
+        tal_mesh_data_send(tal_primary_ele_addr_get(), TUYA_PUB_ADDR, TAL_MESH_OPCODE_DATA, &countdown_data, sizeof(countdown_data));
+    } 
+    else if(tLightCtrlData.uiCountDown==1)
+    {
+        tLightCtrlData.uiCountDown = 0; 
+        countdown_data[0] = 0x01;
+        countdown_data[1] = 0x07;
+        countdown_data[2] = 0x02;
+        countdown_data[3] = (0>>24)&0xff;
+        countdown_data[4] = (0>>16)&0xff;
+        countdown_data[5] = (0>>8)&0xff;
+        countdown_data[6] = (0>>0)&0xff;
+        tal_mesh_data_send(tal_primary_ele_addr_get(), TUYA_PUB_ADDR, TAL_MESH_OPCODE_DATA, &countdown_data, sizeof(countdown_data));
+
+        tLightCtrlData.bSwitch = (tLightCtrlData.bSwitch != FALSE) ? FALSE : TRUE;
+        
+        if (app_light_ctrl_data_switch_get())
+        {
+            set_local_mode_tuya(app_light_ctrl_data_mode_get_value());
+        }
+        opRet = app_light_ctrl_proc();
+        if(opRet != OPRT_OK) {
+            tal_main_debug("CountDown process error!");
+        }
+
+        app_light_ctrl_data_onoff_response(tLightCtrlData.bSwitch);     /* opload after ctrl deal with */
+                // opRet = app_light_ctrl_data_auto_save(TYPE_APP_DATA);
+        if(opRet != OPRT_OK) {
+            tal_main_debug("Light ctrl data auto save error!");
+        }else{
+            tal_main_debug("Light ctrl app auto data save OK !");
+        }
+
+        opRet = tal_sw_timer_stop(countdown_sw_timer);  /* stop timer */
+        if(opRet != OPRT_OK) {
+           tal_main_debug("stop countdown software timer error!");
+        }
+        return;     
+    }
+    else if(tLightCtrlData.uiCountDown==0)
+    {
+        opRet = tal_sw_timer_stop(countdown_sw_timer);  /* stop timer */
+        if(opRet != OPRT_OK) {
+           tal_main_debug("stop countdown software timer error!");
+        }
+        return;   
+    }
+
+    tLightCtrlData.uiCountDown --;       
+
+    opRet = tal_sw_timer_start(countdown_sw_timer, 1000, TAL_TIMER_ONCE);;
+    if(opRet != OPRT_OK) {
+        tal_main_debug("CountDown timer restart error!");
+    }
+}
+
+
+/**
+ * @brief: get light countdown data for vendor
+ * @param {OUT u8 *data}
+ * @attention: data format: please reference to DP protocol
+ * @retval: OPERATE_LIGHT -> LIGHT_OK need to call app_light_real_time_ctrl_proc function.
+ */
+void app_tuya_vendor_light_countdown_data(u8 *data){
+
+    u32 Countdown_time=0;
+    app_light_ctrl_data_countdown_get(&Countdown_time);
+    data[0] = (u8)((Countdown_time>>24)&0xFF);
+    data[1] = (u8)((Countdown_time>>16)&0xFF);
+    data[2] = (u8)((Countdown_time>>8)&0xFF);
+    data[3] = (u8)(Countdown_time&0xFF);
+}
+
+/**
+ * @berief: get light countdown time
+ * @param {OUT u32 *CountdownTime -> Countdown time return} 
+ * @retval: OPERATE_LIGHT
+ */
+OPERATE_RET app_light_ctrl_data_countdown_get(OUT u32 *CountdownTime)
+{
+    *CountdownTime = tLightCtrlData.uiCountDown;
+}
+
+
+VOID_T test_software_timer2_callback(TIMER_ID timer_id, VOID_T *arg)
+{
+    STATIC  UCHAR_T soft_timer2;
+    soft_timer2++;
+    tal_main_debug("soft_timer2:%d", soft_timer2);
+}
+
+
+
+/**
+ * @brief: decompress music data to string format
+ * @param {const IN u8* input_buf} compressed music data
+ * @param {const IN u32 input_buf_len} compressed music data length
+ * @param {OUT char* output_str} decompressed music data,string format
+ * @retval: OPERATE_LIGHT
+ */
+OPERATE_RET ty_light_basis_tools_music_data_decompress(const IN u8* input_buf, const IN u32 input_buf_len, OUT char* output_str)
+{
+    // u16 music_s,music_v;
+    // if(input_buf_len > 4)
+    // {
+    //     return OPRT_INVALID_PARM; 
+    // }
+//    TAL_PR_HEXDUMP_DEBUG("input_buf",input_buf,4);
+
+   
+   output_str[0] = (input_buf[0]>>7)&0X01;//change way//
+   output_str[1] = (input_buf[0]>>6)&0X01;//h high bit//
+   output_str[2] = input_buf[1];//h low bit//
+   output_str[3] = (input_buf[0]>>2)&0X03;//s high bit//
+   output_str[4] = input_buf[2];// s low bit//
+   output_str[5] = (input_buf[0])&0X03;//V high bit//
+   output_str[6] = input_buf[3];//v low bit//   
+//    TAL_PR_HEXDUMP_DEBUG("output_str",output_str,7);
+
+//    music_s = (output_str[3] << 8)|output_str[4];
+//    music_v = (output_str[5] << 8)|output_str[6];
+//    music_s = (float)music_s * 255 / 1000;
+//    music_v = (float)music_v * 205 / 1000;
+
+//    output_str[7] = music_s;
+//    output_str[7] = music_s;
+        return OPRT_OK;
+
+
+}
+
+/**
+ * @brief: set light realtime control data
+ * @param {IN BOOL_T bMusicFlag}
+ * @param {IN CHAR_T *pRealTimeData}
+ * @attention: data format: please reference to DP protocol
+ * @retval: OPERATE_RET -> LIGHT_OK need to call app_light_real_time_ctrl_proc function.
+ */
+OPERATE_RET app_light_ctrl_data_realtime_adjust_set(IN bool bMusicFlag, IN char *pRealTimeData)
+{
+    if(bMusicFlag) {
+        if(tLightCtrlData.eMode != MUSIC_MODE) {
+            tal_main_debug("Music data don't accpected, bacause mode is not music mode!");
+            return OPRT_INVALID_PARM; 
+        }
+    }
+    
+    // if(tal_system_memcmp(pRealTimeData, tLightCtrlData.cRealTimeData,sizeof(tLightCtrlData.cRealTimeData)) == 0) {
+    //     tal_main_debug("the same realtime adjust data");
+    //     return OPRT_INVALID_PARM;
+    // }
+
+    // if(strlen(pRealTimeData) != 21) {
+    //     tal_main_debug("Real time adjust data is error! please chek!");
+    //     return OPRT_INVALID_PARM;
+    // }
+
+    // strcpy((char*)&tLightCtrlData.cRealTimeData, pRealTimeData);
+    tal_system_memcpy(tLightCtrlData.cRealTimeData, pRealTimeData, sizeof(tLightCtrlData.cRealTimeData));
+    // TAL_PR_HEXDUMP_DEBUG("pRealTimeData",pRealTimeData,7);
+    //  TAL_PR_HEXDUMP_DEBUG("tLightCtrlData.cRealTimeData",tLightCtrlData.cRealTimeData,7);
+    // tal_main_debug("light real time adjust ctrl data buf %s",tLightCtrlData.cRealTimeData);
+
+    return OPRT_OK;
+}
+
+/**
+ * @brief: Light realtime ctrl process ʵʱ���ƴ���
+ * @param {none}
+ * @retval: OPERATE_LIGHT
+ */
+OPERATE_RET app_light_real_time_ctrl_proc(void)
+{
+    u8 ucChangeMode = 0;
+    // u16 usBright ,usTemp;
+    u16 usHue, usSat, usVal;
+    LIGHT_CTRL_DATA_T tCtrlDataTemp;
+    OPERATE_RET opRet = 1;
+    static u8 music_trige = 0;
+
+    // COLOR_RGB_T ColorDataTemp;
+
+    if(!tLightCtrlData.bSwitch) {        /* make sure realtime adjust dp can't active! */
+        return OPRT_OK;
+    }
+    
+   //*数值解析//  
+    ucChangeMode = tLightCtrlData.cRealTimeData[0] - '0';
+
+    usHue = (u16)(tLightCtrlData.cRealTimeData[1] << 8) | tLightCtrlData.cRealTimeData[2];
+    usSat = (u16)(tLightCtrlData.cRealTimeData[3] << 8) | tLightCtrlData.cRealTimeData[4];
+    usVal = (u16)(tLightCtrlData.cRealTimeData[5] << 8) | tLightCtrlData.cRealTimeData[6];
+
+    usSat = (float)usSat * 255 / 1000;
+    usVal = (float)usVal * 50 / 1000; //* 音乐模式限制亮度最大值//
+
+    tal_main_debug("hsv %d %d %d ",usHue,usSat,usVal);
+    if(usVal < MIN_COLOR_LIGHTNESS)
+    {
+        usVal = MIN_COLOR_LIGHTNESS;
+    }
+    // sys_status.music_color = USE_HSVtoRGB(usHue,usSat,usVal);
+
+    // if(usVal <= 20)
+    // {
+    //     sys_status.music_led_level = 0;
+    // }
+    // else if (usVal <= 40)
+    // {
+    //     sys_status.music_led_level = 1;
+    // }
+    // else if (usVal <= 70)
+    // {
+    //     sys_status.music_led_level = 2;
+    // }    
+    // else if (usVal <= 95)
+    // {
+    //     sys_status.music_led_level = 3;
+    // }        
+    // else if (usVal <= 110)
+    // {
+    //     sys_status.music_led_level = 4;
+    // }   
+    // else
+    // {
+    //     sys_status.music_led_level = 5;
+    // }     
+    // if(ucChangeMode)
+    // {
+        // gpio_write(EN_RGB,1);
+        // light_onoff_HSV(0,usVal,usHue,usSat);
+
+    // }
+    // else
+    // {
+        if(usHue != 0)
+        {
+            usHue = rand()%340 + 10;
+        }
+        sys_status.music_color = usHue;//�洢 ��ɫֵ�жϾ���״̬���߱仯//
+        sys_status.music_lightness_ta = usVal;
+        if(usHue == 0)
+        {
+            sys_status.music_color = 0;
+            // sys_status.music_lightness_ta = 12;
+            // sys_status.music_lightness_pr = 12;
+        }        
+        sys_status.music_sign = 1;
+        sys_status.music_led_time = 0;
+    if(sys_status.music_lightness_ta != sys_status.music_lightness_pr)
+    {
+        if(++music_trige >= 5) 
+       {
+             music_trige = 0;
+            // sys_status.music_lightness_pr =  sys_status.music_lightness_ta ;
+            sys_status.music_led_level = 0;
+        }
+      
+    }        
+        gpio_write(EN_RGB,1);
+        light_moment_HSV(0,1,usVal,usHue,usSat);        
+    // }
+
+
+    return OPRT_OK;
+}
+//===========================================================================================//
+//
+//                       .::::.
+//                     .::::::::.
+//                    :::::::::::
+//                 ..:::::::::::'
+//              '::::::::::::'
+//                .::::::::::
+//           '::::::::::::::..
+//                ..::::::::::::.
+//              ``::::::::::::::::
+//               ::::``:::::::::'        .:::.
+//              ::::'   ':::::'       .::::::::.
+//            .::::'      ::::     .:::::::'::::.
+//           .:::'       :::::  .:::::::::' ':::::.
+//          .::'        :::::.:::::::::'      ':::::.
+//         .::'         ::::::::::::::'         ``::::.
+//     ...:::           ::::::::::::'              ``::.
+//    ````':.          ':::::::::'                  ::::..
+//                       '.:::::'                    ':'````..
+
+//======================data response=============================================//
+/**
+* @description: response light state after control in on-off model 
+* @param[in] {IN bool Onoff} control command: 1->on,0->off
+*?@return:none
+**/
+void app_light_ctrl_data_onoff_response(IN bool Onoff)
+{
+    TAL_MESH_GENERIC_ONOFF_STATUS_T onoff_status = {0};
+    onoff_status.present = Onoff;    
+	//mesh数据发送
+    tal_mesh_data_send(tal_primary_ele_addr_get(), 0xD000, TAL_MESH_OPCODE_ON_OFF_STAT, (UINT8_T*)&onoff_status, sizeof(UCHAR_T));
+    //数据主动上报
+}
+
+
+
+/**
+****************************************************************************************
+ * @description: push battery data
+ * @attention:  
+ * @return {*} Battery data
+****************************************************************************************
+*/
+void Send_battery_data(void)
+{
+	u8 Battery_data[7]= {0};
+	Battery_data[0] = 0x01;
+	Battery_data[1] = VD_CMD_BAT_PERCENT;//*DPID // 
+	Battery_data[2] = 0x02;//*Value 数值类型 //  
+	Battery_data[3] = 00;
+	Battery_data[4] = 00;
+	Battery_data[5] = 00;
+	Battery_data[6] = sys_status.cap_percent;//*大小端排列 //  
+	tal_mesh_data_send(tal_primary_ele_addr_get(), TUYA_PUB_ADDR, TAL_MESH_OPCODE_DATA, &Battery_data, sizeof(Battery_data));
+}
+
+
+/**
+* @description: response light mode after control in mode model 
+* @param[in]    none
+*?@return:none
+**/
+void app_light_ctrl_data_mode_response(void)
+{
+
+    u8 lightmode = app_light_ctrl_data_mode_get_value();
+
+    TAL_PR_DEBUG("lightmode %d",lightmode);
+
+    tal_mesh_data_send(tal_primary_ele_addr_get(), 0xD000, TAL_MESH_OPCODE_DATA, (UINT8_T*)&lightmode, sizeof(UCHAR_T));
+    
+}
+
+
+/**
+* @description: response light user mode after control in mode model 
+* @param[in] none
+*?@return:none    
+**/
+void app_light_ctrl_user_mode_response(void)
+{
+
+    u8 mode_data[4]= {0};
+    mode_data[0] = 0x01;
+    mode_data[1] = VD_CMD_SPECIAL_MODE;//*DPID // 
+    mode_data[2] = 0x04; //*Enum 枚举类型 //   
+    mode_data[3] = app_light_user_mode_get_value();  
+
+    TAL_PR_HEXDUMP_DEBUG("mode_data",mode_data,sizeof(mode_data));
+    tal_mesh_data_send(tal_primary_ele_addr_get(), TUYA_PUB_ADDR, TAL_MESH_OPCODE_DATA, &mode_data, sizeof(mode_data));
+    
+}
+
+
+/**
+ * @brief 游戏模式状态上报
+ * 
+ */
+void app_light_ctrl_game_mode_response(void)
+{
+
+    u8 game_data[4]= {0};
+    game_data[0] = 0x01;
+    game_data[1] = VD_CMD_EN_GAME;  //*DPID //                                  
+    game_data[2] = 0x01;  //*BOOL布尔类型 //
+    game_data[3] = 0;
+
+    // TAL_PR_HEXDUMP_DEBUG("mode_data",mode_data,sizeof(mode_data));
+    tal_mesh_data_send(tal_primary_ele_addr_get(), TUYA_PUB_ADDR, TAL_MESH_OPCODE_DATA, &game_data, sizeof(game_data));
+    
+}
+
+
+
