@@ -1,0 +1,43 @@
+{
+    "SDKType": "1",
+    "bv": "40.00",
+    "chipInfoList": [
+        "wireless SoC/Telink/Bluetooth/TLSR825X"
+    ],
+    "feature": "https://images.tuyacn.com/smart/sdk/information/cw7a51iz5tkw",
+    "offShelfReasonCN": "",
+    "offShelfReasonEN": "",
+    "sdkDescCN": "test",
+    "sdkDescEN": "test",
+    "sdkId": 100001,
+    "sdkName": "tuyaos-subdev-mesh-tlsr825x_smesh-mesh_common",
+    "sdkVerDescCN": "优化 kernal 接口，修复部分问题",
+    "sdkVerDescEN": "Optimize the kernal interface and fix some problems",
+    "sdkVersion": "1.0.2",
+    "sdkVersionFileSize": "111610009",
+    "sdkVersionMd5": "9a257eb8fa6efbf38cf8aec0ca8d60e1",
+    "sdkVersionOffShelf": false,
+    "tuyaosVersion": "TuyaOS-3.8.0",
+    "typeCode": "EmbeddedPackage-SubDevice:Mesh",
+    "typeNameCN": "子设备开发:蓝牙 Mesh 设备开发包",
+    "typeNameEN": "Sub-Device Development:Bluetooth Mesh Device Development Kit",
+    "quickStartDemoName": "",
+    "quickStartDemoAddr": "",
+    "typeDemoName": [
+        "tuyaos_demo_mesh_node"
+    ],
+    "typeDemoAddr": [
+        "https://airtake-public-data-1254153901.cos.ap-shanghai.myqcloud.com/smart/embed/pruduct/tuyaos_demo_mesh_node_0.22.tar.gz"
+    ],
+    "package": {
+        "MainPackage": {
+            "Name": "tuyaos-subdev-mesh_1.0.2_tlsr825x_smesh_mesh_common_1.2.21.tar.gz"
+        },
+        "Packages": [],
+        "CurrentPackage": {
+            "Name": "tuyaos-subdev-mesh_1.0.2_tlsr825x_smesh_mesh_common_1.2.21.tar.gz"
+        }
+    },
+    "sdkVersionId": "333008",
+    "id": 100001
+}

@@ -1,0 +1,21 @@
+{
+    "OsVersion": "3.8.0",
+    "SDKType": "1",
+    "demo": {
+        "QuickstartDemo": {},
+        "TypeDemo": [
+            {
+                "Name": "tuyaos_demo_mesh_node",
+                "Addr": "https://airtake-public-data-1254153901.cos.ap-shanghai.myqcloud.com/smart/embed/pruduct/tuyaos_demo_mesh_node_0.17.tar.gz"
+            }
+        ]
+    },
+    "package": {
+        "MainPackage": {
+            "Name": "tuyaos-subdev-mesh_1.0.2_tlsr825x_smesh_mesh_common_1.2.21.tar.gz"
+        },
+        "Packages": []
+    },
+    "toolchain_pack_url": "https://airtake-public-data-1254153901.cos.ap-shanghai.myqcloud.com/smart/embed/pruduct/tlsr825x_smesh_1.2.21.zip",
+    "AblityValue": {}
+}
